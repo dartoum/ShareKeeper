@@ -5,7 +5,13 @@ APP=ShareKeeper.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-swiftc -O -swift-version 5 Sources/Core/*.swift Sources/App/main.swift -o "$APP/Contents/MacOS/ShareKeeper"
+# Universal (Apple silicon + Intel), for macOS 13 and later, whatever the builder's own macOS is.
+BUILD=$(mktemp -d)
+for ARCH in arm64 x86_64; do
+    swiftc -O -swift-version 5 -target "$ARCH-apple-macos13.0" Sources/Core/*.swift Sources/App/main.swift -o "$BUILD/ShareKeeper-$ARCH"
+done
+lipo -create "$BUILD"/ShareKeeper-arm64 "$BUILD"/ShareKeeper-x86_64 -output "$APP/Contents/MacOS/ShareKeeper"
+rm -rf "$BUILD"
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -16,6 +22,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>0.4.0</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>ShareKeeper finds your other Macs running ShareKeeper and connects to them to share folders.</string>
 <key>NSBonjourServices</key><array><string>_sharekeeper._tcp</string></array>
 </dict></plist>
@@ -25,14 +33,16 @@ EOF
 #                               account; add notarization for no warning at all, see AGENTS.md)
 #   Apple Development         - stable identity: Local Network permission survives rebuilds, but
 #                               Gatekeeper on another Mac still asks for right-click -> Open
-#   ad-hoc                    - last resort; the permission is asked again after every rebuild
+#   ad-hoc                    - last resort; the permission is asked again after every rebuild.
+#                               SIGN_IDENTITY=- forces it: used for public releases, so that nothing of the
+#                               builder (name, e-mail, team id) ends up in the signature
 LIST=$(security find-identity -v -p codesigning 2>/dev/null || true)
 pick() { echo "$LIST" | grep "$1" | head -1 | sed -E 's/^ *[0-9]+\) ([0-9A-F]{40}) .*/\1/' || true; }
 IDENTITY="${SIGN_IDENTITY:-$(pick 'Developer ID Application')}"
 [ -n "$IDENTITY" ] || IDENTITY=$(pick 'Apple Development')
 if [ -n "$IDENTITY" ]; then
     OPTS=()
-    if echo "$LIST" | grep "$IDENTITY" | grep -q 'Developer ID'; then OPTS=(--options runtime --timestamp); fi
+    if echo "$LIST" | grep -- "$IDENTITY" | grep -q 'Developer ID'; then OPTS=(--options runtime --timestamp); fi
     codesign --force ${OPTS[@]+"${OPTS[@]}"} --sign "$IDENTITY" "$APP"
     echo "Signed with: $(codesign -dvv "$APP" 2>&1 | grep '^Authority=' | head -1)"
 else

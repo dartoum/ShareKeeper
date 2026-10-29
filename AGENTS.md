@@ -2,7 +2,7 @@
 
 Menu bar app for my own Macs: one folder, `~/ShareKeeper`, with the same contents on every paired Mac.
 Put something in it on one Mac and it shows up on the other; nothing else is shared. Personal use, macOS
-only. One Mac is restricted with File Sharing off there, so this does not use File Sharing.
+only. One of the Macs cannot use macOS File Sharing, so this does not use it.
 
 ## How it works
 - **Own link between Macs** (`Sources/Core`): Bonjour `_sharekeeper._tcp`, then a TCP connection that is
@@ -10,7 +10,7 @@ only. One Mac is restricted with File Sharing off there, so this does not use Fi
   keys, HKDF, ChaCha20-Poly1305 frames. Request/response RPC with a JSON header and raw file bytes (`Wire.swift`).
 - **Either Mac may dial, one link serves both directions.** Frames are tagged request/response; a paired Mac
   that dials us has its connection adopted by our `RemoteClient` (`PeerListener.adopt`). Needed in practice:
-  the other Mac sees us on Bonjour, we do not see it. If both dial at once, both keep the link dialed by
+  one Mac sees the other on Bonjour while the other does not see it. If both dial at once, both keep the link dialed by
   the Mac with the smaller id; otherwise a fresh link replaces an older one.
 - **Pairing** is once per pair: one Mac picks the other under "Pair a New Mac", both show a six digit code
   (numeric comparison with commit/reveal, so a man in the middle cannot grind matching keys), the user
@@ -26,8 +26,8 @@ only. One Mac is restricted with File Sharing off there, so this does not use Fi
 - **Confinement** (`FileServer.swift`), on the Mac that owns the files: no `..`, symlinks only followed when
   they stay inside the folder, `scan` does not follow them at all.
 
-- **App behaviour**: Dock icon by default (menu: "Show in Dock" to go menu-bar only), click on it opens the
-  folder. Notifications (UserNotifications): paired, and per sync run what arrived / was removed / was kept
+- **App behaviour**: menu bar only, no Dock icon (it runs all day; a permanent Dock icon was unwanted);
+  starting the app again opens the folder. Notifications (UserNotifications): paired, and per sync run what arrived / was removed / was kept
   twice; the driving Mac sends the other Mac a mirrored `SyncReport` ("report" request) so both say it.
   App icon: `assets/make-icon.sh` regenerates `AppIcon.icns` from `make-icon.swift`.
 
@@ -35,7 +35,7 @@ only. One Mac is restricted with File Sharing off there, so this does not use Fi
 - Sync, not a mounted network drive (0.2 mounted the other Mac via a loopback NFS server). Wanted: one
   ordinary folder in home with only the shared things in it, on both Macs. Sync gives exactly that, keeps
   working when the other Mac is off, and has no NFS client quirks. Cost: files exist on both Macs.
-- Rejected: macOS File Sharing/SMB ((not available)), FUSE (driver install), WebDAV, forking Deskflow (it removed
+- Rejected: macOS File Sharing/SMB (not available on one Mac), FUSE (driver install), WebDAV, forking Deskflow (it removed
   file transfer on purpose; server/client model), FileDonkey's code (CC BY-NC, no auth). Nothing copied.
 - Deletes go to the Trash, never straight away: a sync bug must not be able to lose files.
 - The private key is a 0600 file in `~/Library/Application Support/ShareKeeper`, not the keychain: an

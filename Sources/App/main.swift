@@ -22,11 +22,6 @@ enum Store {
         get { UserDefaults.standard.data(forKey: "peers").flatMap { try? JSONDecoder().decode([PeerRecord].self, from: $0) } ?? [] }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: "peers") }
     }
-    /// In the Dock and Cmd-Tab like any app (default), or only in the menu bar.
-    static var showDock: Bool {
-        get { UserDefaults.standard.object(forKey: "showDock") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "showDock") }
-    }
 }
 
 enum Notifier {
@@ -211,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         done([.banner])
     }
 
-    /// Clicking the Dock icon opens the folder, which is what the app is about.
+    /// Starting the app again (Finder, Spotlight) while it runs opens the folder, which is what it is about.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         openFolder()
         return false
@@ -372,9 +367,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(pair)
         menu.addItem(.separator())
 
-        let dock = NSMenuItem(title: "Show in Dock", action: #selector(toggleDock), keyEquivalent: "")
-        dock.target = self; dock.state = Store.showDock ? .on : .off
-        menu.addItem(dock)
         let login = NSMenuItem(title: "Launch on login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -428,11 +420,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    @objc func toggleDock() {
-        Store.showDock.toggle()
-        NSApp.setActivationPolicy(Store.showDock ? .regular : .accessory)
-    }
-
     @objc func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -444,5 +431,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(Store.showDock ? .regular : .accessory)
+app.setActivationPolicy(.accessory)
 app.run()
