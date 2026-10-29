@@ -36,3 +36,7 @@ Tests/run.sh                           # integration tests, no second Mac needed
 ```
 
 `SIGN_IDENTITY=-` builds ad-hoc signed; otherwise the best code signing identity in your keychain is used.
+
+## License
+
+[MIT](LICENSE)
