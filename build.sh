@@ -20,7 +20,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <key>CFBundleName</key><string>ShareKeeper</string>
 <key>CFBundleExecutable</key><string>ShareKeeper</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.4.0</string>
+<key>CFBundleShortVersionString</key><string>0.4.1</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
