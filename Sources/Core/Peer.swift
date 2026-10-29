@@ -15,6 +15,9 @@ final class PeerListener: @unchecked Sendable {
     /// Nothing is stored unless the user says yes here and the other side says yes too.
     var confirmPairing: @Sendable (String, String) async -> Bool = { _, _ in false }
     var onPaired: @Sendable (Data, String) -> Void = { _, _ in }
+    /// A paired Mac dialed us and passed the key check: (its peer id, the link). Return true when the link
+    /// was taken over (it then also serves our folder to that Mac); false and the listener serves it itself.
+    var adopt: @Sendable (Data, Channel) -> Bool = { _, _ in false }
 
     private var listener: NWListener?
     private(set) var port: UInt16 = 0
@@ -70,9 +73,11 @@ final class PeerListener: @unchecked Sendable {
             let magic = try await withTimeout(10, onTimeout: { conn.close() }) { try await conn.recv(4) }
             switch String(decoding: magic, as: UTF8.self) {
             case "SKH1":
-                let (ch, _) = try await withTimeout(10, onTimeout: { conn.close() }) {
+                let (ch, peerPub) = try await withTimeout(10, onTimeout: { conn.close() }) {
                     try await Handshake.accept(conn, me: self.me, lookup: self.lookupPeer)
                 }
+                lock.lock(); active[ObjectIdentifier(ch)] = ch.conn; lock.unlock()
+                if adopt(Identity.id(of: peerPub), ch) { return }
                 await serve(ch)
             case "SKP1":
                 let (pub, peerName) = try await withTimeout(180, onTimeout: { conn.close() }) {
@@ -97,16 +102,16 @@ final class PeerListener: @unchecked Sendable {
 
     private func serve(_ ch: Channel) async {
         let key = ObjectIdentifier(ch)
-        lock.lock(); active[key] = ch.conn; lock.unlock()
         defer { lock.lock(); active[key] = nil; lock.unlock() }
         do {
             while true {
                 let frame = try await ch.recv()
-                let (req, body) = try Frame.unpack(Request.self, frame)
+                guard frame.first == Tag.request else { continue }
+                let (req, body) = try Frame.unpack(Request.self, Data(frame.dropFirst()))
                 Task {
                     // Asked again per request, so switching sharing off or to read-only takes effect at once.
                     let (resp, out) = await dispatch(sharedServer(), req, body)
-                    if let reply = try? Frame.pack(resp, body: out) { try? await ch.send(reply) }
+                    if let reply = try? Frame.pack(resp, body: out) { try? await ch.send(Data([Tag.response]) + reply) }
                 }
             }
         } catch {

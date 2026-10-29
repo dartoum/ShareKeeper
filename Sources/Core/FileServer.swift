@@ -6,6 +6,14 @@ import Foundation
 final class FileServer: FileBackend {
     let root: String
     var readOnly: Bool
+    /// Where `trash` puts things; nil = the user's Trash. Tests set a folder of their own.
+    var trashDir: String?
+
+    /// Names that are never synced: Finder's and macOS's own bookkeeping, and our half-written copies.
+    static func ignored(_ name: String) -> Bool {
+        name == ".DS_Store" || name.hasPrefix("._") || name.hasPrefix(".sk-tmp-") || name == "Icon\r"
+            || name == ".localized" || name == ".Trashes" || name == ".fseventsd" || name == ".Spotlight-V100"
+    }
 
     init?(root: String, readOnly: Bool = false) {
         guard let r = realPath(root) else { return nil }
@@ -179,6 +187,50 @@ final class FileServer: FileBackend {
         return try attrOf(real: real)
     }
 
+    func scan() async throws -> [Entry] {
+        var rootSt = stat()
+        guard lstat(root, &rootSt) == 0 else { throw FSError(errno) }
+        var out: [Entry] = []
+        func walk(_ real: String, _ vdir: String) {
+            guard let d = opendir(real) else { return }
+            var names: [String] = []
+            while let e = Darwin.readdir(d) {
+                let name = withUnsafePointer(to: &e.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+                }
+                if name != "." && name != ".." && !FileServer.ignored(name) { names.append(name) }
+            }
+            closedir(d)
+            for name in names.sorted() {
+                let r = real + "/" + name
+                var st = stat()
+                // lstat: a symlink is not followed (attr(from:) refuses it), and nothing on another volume counts.
+                guard lstat(r, &st) == 0, st.st_dev == rootSt.st_dev, let a = try? attr(from: st) else { continue }
+                let v = joinPath(vdir, name)
+                out.append(Entry(name: v, attr: a))
+                if a.kind == 2 { walk(r, v) }
+            }
+        }
+        walk(root, "/")
+        return out
+    }
+
+    func trash(_ path: String) async throws {
+        try writable()
+        let real = try resolveEntry(path)
+        if let dir = trashDir {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let dest = dir + "/" + UUID().uuidString.prefix(8) + "-" + (real as NSString).lastPathComponent
+            guard Darwin.rename(real, dest) == 0 else { throw FSError(errno) }
+            return
+        }
+        do { try FileManager.default.trashItem(at: URL(fileURLWithPath: real), resultingItemURL: nil) }
+        catch {
+            let code = ((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.code
+            throw FSError(code.map { Int32($0) } ?? EIO)
+        }
+    }
+
     func statfs() async throws -> FsStat {
         var s = statvfs()
         guard statvfs(root, &s) == 0 else { throw FSError(errno) }
@@ -213,6 +265,8 @@ func dispatch(_ fs: FileServer?, _ req: Request, _ body: Data) async -> (Respons
         case "setattr":
             resp.attr = try await fs.setattr(req.path, mode: req.mode, size: req.size, atime: req.atime, mtime: req.mtime)
         case "statfs": resp.stat = try await fs.statfs()
+        case "scan": resp.entries = try await fs.scan()
+        case "trash": try await fs.trash(req.path)
         default: resp.err = ENOSYS
         }
     } catch let e as FSError {

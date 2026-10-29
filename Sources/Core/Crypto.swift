@@ -41,6 +41,8 @@ private func secret(_ priv: PrivKey, _ pub: Data) throws -> Data {
 /// Encrypted, authenticated frames. One reader at a time; any number of writers.
 final class Channel: @unchecked Sendable {
     let conn: Conn
+    /// True when this Mac dialed the connection.
+    let initiator: Bool
     private let sendKey: SymmetricKey
     private let recvKey: SymmetricKey
     private var sendCtr: UInt64 = 0
@@ -48,8 +50,9 @@ final class Channel: @unchecked Sendable {
     private let lock = NSLock()
     static let maxFrame = 4 << 20
 
-    init(conn: Conn, sendKey: SymmetricKey, recvKey: SymmetricKey) {
+    init(conn: Conn, initiator: Bool, sendKey: SymmetricKey, recvKey: SymmetricKey) {
         self.conn = conn
+        self.initiator = initiator
         self.sendKey = sendKey
         self.recvKey = recvKey
     }
@@ -111,7 +114,7 @@ enum Handshake {
 
         let dh = [try secret(eI, eR), try secret(me.key, eR), try secret(eI, peerPub), try secret(me.key, peerPub)]
         let k = keys(dh, salt: Data(SHA256.hash(data: m1 + eR)))
-        return Channel(conn: conn, sendKey: k.ir, recvKey: k.ri)
+        return Channel(conn: conn, initiator: true, sendKey: k.ir, recvKey: k.ri)
     }
 
     /// The four magic bytes are already read. `lookup` maps a peer id to the public key it paired with.
@@ -127,7 +130,7 @@ enum Handshake {
 
         let dh = [try secret(eR, eI), try secret(eR, sI), try secret(me.key, eI), try secret(me.key, sI)]
         let k = keys(dh, salt: Data(SHA256.hash(data: m1 + eR.publicKey.rawRepresentation)))
-        return (Channel(conn: conn, sendKey: k.ri, recvKey: k.ir), sI)
+        return (Channel(conn: conn, initiator: false, sendKey: k.ri, recvKey: k.ir), sI)
     }
 }
 

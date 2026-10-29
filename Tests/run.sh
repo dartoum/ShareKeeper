@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds the Core together with the integration test and runs it. Needs no GUI and no second Mac:
-# both sides run in one process over loopback, and the share is mounted through the real NFS client.
+# both sides run in one process over loopback, and the share is synced between two folders, also over the encrypted link.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="${TMPDIR:-/tmp}/sharekeeper-tests"

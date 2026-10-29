@@ -1,51 +1,52 @@
 # ShareKeeper
 
-Menu bar app for my own Macs: share one folder, and mount the folders of my other Macs as volumes.
-Personal use, macOS only. A Mac with restrictions may have File Sharing off, so this does not use it.
+Menu bar app for my own Macs: one folder, `~/ShareKeeper`, with the same contents on every paired Mac.
+Put something in it on one Mac and it shows up on the other; nothing else is shared. Personal use, macOS
+only. One Mac is restricted with File Sharing off there, so this does not use File Sharing.
 
 ## How it works
 - **Own link between Macs** (`Sources/Core`): Bonjour `_sharekeeper._tcp`, then a TCP connection that is
   mutually authenticated and encrypted by our own handshake (`Crypto.swift`): X25519 static + ephemeral
   keys, HKDF, ChaCha20-Poly1305 frames. Request/response RPC with a JSON header and raw file bytes (`Wire.swift`).
-- **Pairing** is once per pair of Macs: numeric comparison of a six digit code on both screens, with a
-  commit/reveal so a man in the middle cannot grind keys that give the same code. One Mac picks the other
-  from the Bonjour list ("Pair with…"); the other shows the code prompt by itself (no "allow pairing" mode,
-  the user has to confirm the code anyway; one prompt at a time). After pairing each side stores the other's
-  public key; a Mac that never shared anything starts sharing `~/ShareKeeper Drop` (created, announced in an alert, changeable in the menu — not re-enabled for someone who turned sharing off or chose a folder); unknown or wrong-key peers are dropped before any file
-  data is exchanged.
-- **Not sharing is a state, not an error**: a paired Mac with sharing off still connects; `ping` answers
-  `sharing: false`, files answer EACCES, the menu says "not sharing a folder yet", and the mounting Mac
-  mounts by itself within ~10 s (the ping interval) of the other turning sharing on.
-- **Sharing side** (`FileServer.swift`): serves one chosen folder. All confinement is here, on the Mac that
-  owns the files: no `..`, symlinks only followed when they stay inside the folder (others are hidden).
-  Sharing off / read-only is checked per request, so it applies to links that are already open.
-- **Mounting side** (`NFS.swift`): a small NFSv3 + MOUNT server on 127.0.0.1 (same idea as Continuo) that
-  turns NFS calls into RPCs on the link; `mount_nfs` mounts it at `~/ShareKeeper/<Mac name>`.
-  Only calls from our own uid (or root) are accepted, because any local process can reach a loopback port.
-  The mount survives a lost link: requests wait up to 6 s for the reconnect, then fail with EIO.
-  Mount options matter: `soft,dumbtimer,timeo=100`. Without `dumbtimer` the client learns the loopback
-  round trip time and gives up on a soft mount after well under a second (ETIMEDOUT), so a reconnect
-  after sleep would surface as errors.
-- `App/main.swift` is only the menu bar UI and glue (wake / network change → reconnect, stale mount cleanup
-  at launch, unmount at quit).
+- **Either Mac may dial, one link serves both directions.** Frames are tagged request/response; a paired Mac
+  that dials us has its connection adopted by our `RemoteClient` (`PeerListener.adopt`). Needed in practice:
+  the other Mac sees us on Bonjour, we do not see it. If both dial at once, both keep the link dialed by
+  the Mac with the smaller id; otherwise a fresh link replaces an older one.
+- **Pairing** is once per pair: one Mac picks the other under "Pair a New Mac", both show a six digit code
+  (numeric comparison with commit/reveal, so a man in the middle cannot grind matching keys), the user
+  confirms on both. That is the only setup step.
+- **Sync** (`Sync.swift`): three-way, per pair, driven by the Mac with the smaller id (the other only answers
+  and sends "changed" when its folder changes). Base state per peer in
+  `~/Library/Application Support/ShareKeeper/sync-<peer id>.json`.
+  New/changed on one side → copied (temp name, then rename, mtime carried over). Deleted on one side and
+  untouched on the other → the other side's copy goes to the Trash. Changed on both → both kept, the other
+  Mac's version as "name (Other Mac).ext". A folder deleted on one side keeps whatever was changed in it on
+  the other. Finder's `.DS_Store`, `._*` etc. are never synced; symlinks and other volumes are skipped.
+- **Triggers**: a 3 s scan of `~/ShareKeeper` for changes, the peer's "changed" nudge, link up, and every 20 s.
+- **Confinement** (`FileServer.swift`), on the Mac that owns the files: no `..`, symlinks only followed when
+  they stay inside the folder, `scan` does not follow them at all.
 
 ## Decisions
-- Rejected: macOS File Sharing/SMB ((not available) blocks it on one Mac; v0.1 of this repo did that), FUSE
-  (driver install, three platforms), WebDAV (macOS fetches whole files; writes need fake locks),
-  FileDonkey's code (CC BY-NC, and no auth, no path confinement). We read its design, copied nothing.
-- Loopback NFS over WebDAV for partial reads and normal write semantics.
+- Sync, not a mounted network drive (0.2 mounted the other Mac via a loopback NFS server). Wanted: one
+  ordinary folder in home with only the shared things in it, on both Macs. Sync gives exactly that, keeps
+  working when the other Mac is off, and has no NFS client quirks. Cost: files exist on both Macs.
+- Rejected: macOS File Sharing/SMB ((not available)), FUSE (driver install), WebDAV, forking Deskflow (it removed
+  file transfer on purpose; server/client model), FileDonkey's code (CC BY-NC, no auth). Nothing copied.
+- Deletes go to the Trash, never straight away: a sync bug must not be able to lose files.
 - The private key is a 0600 file in `~/Library/Application Support/ShareKeeper`, not the keychain: an
   ad-hoc signed rebuild would make the keychain prompt again.
-- Not supported on purpose: symlinks, hard links, device nodes, extended attributes, file locking across
-  Macs (`locallocks`: locks are local only).
+- At launch, 0.2 leftovers are cleaned up: loopback NFS mounts under `~/ShareKeeper` are unmounted and
+  their empty folders removed, and `~/ShareKeeper Drop` is moved into `~/ShareKeeper`.
 
 ## Build / test
-- `./build.sh && open ShareKeeper.app`. Logs: `log stream --predicate 'subsystem == "nl.david.ShareKeeper"'`.
-- `Tests/run.sh`: both sides in one process over loopback, mounted through the real NFS client (about
-  50 checks: confinement, pairing, strangers refused, file ops via `cp/mv/rm`, reconnect, sharing off).
+- `./build.sh && open ShareKeeper.app`; `./dmg.sh` makes `ShareKeeper-<version>.dmg`.
+  Logs: `/usr/bin/log stream --predicate 'subsystem == "nl.david.ShareKeeper"'` (plain `log` is a zsh builtin).
+- `Tests/run.sh`: both sides in one process (confinement, pairing, strangers refused, link both ways,
+  reconnect, sync: new/edit/delete/conflict/folder-delete-vs-edit/3 MB/restart, sync over the link).
   It does not cover Bonjour discovery or the menu.
 
 ## Open
-- Not yet tried between two real Macs (Bonjour discovery, the Local Network permission prompt, sleep/wake).
-- Finder sidebar: a mount at `~/ShareKeeper/…` is not in the sidebar; use "Open in Finder" or drag the folder in.
-- No rate limiting on pairing attempts; pairing is only open for two minutes after the user asks for it.
+- Change detection is polling (3 s); fine for an exchange folder, not for very large trees (FSEvents).
+- A scan reply is one frame (max 4 MB), roughly 20 000 entries.
+- An edit made in the moment a copy over that same file is renamed into place can be lost.
+- The dmg is ad-hoc signed: Gatekeeper needs right-click → Open the first time.

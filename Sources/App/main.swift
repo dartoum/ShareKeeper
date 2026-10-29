@@ -3,8 +3,9 @@ import Network
 import ServiceManagement
 import os
 
-// ShareKeeper: shares one folder of this Mac with your other Macs and mounts theirs here as volumes,
-// over an encrypted link of its own. No File Sharing, no accounts, no FUSE driver. See AGENTS.md.
+// ShareKeeper: one folder, ~/ShareKeeper, with the same contents on every Mac you pair. Put something in
+// it on one Mac and it appears on the other. Nothing else is shared, nothing to set up after pairing.
+// See AGENTS.md.
 
 // MARK: - Settings
 
@@ -12,32 +13,18 @@ struct PeerRecord: Codable {
     var id: String        // hex of the 8 byte peer id
     var name: String
     var pub: String       // hex of the X25519 public key it paired with
-    var auto: Bool        // false = unmounted by hand; stays that way until mounted again
+    var auto: Bool        // kept for settings written by 0.2; unused
 }
 
 enum Store {
-    private static let d = UserDefaults.standard
-
     static var peers: [PeerRecord] {
-        get { d.data(forKey: "peers").flatMap { try? JSONDecoder().decode([PeerRecord].self, from: $0) } ?? [] }
-        set { d.set(try? JSONEncoder().encode(newValue), forKey: "peers") }
-    }
-    static var sharedPath: String? {
-        get { d.string(forKey: "sharedPath") }
-        set { d.set(newValue, forKey: "sharedPath") }
-    }
-    static var sharing: Bool {
-        get { d.bool(forKey: "sharing") }
-        set { d.set(newValue, forKey: "sharing") }
-    }
-    static var readOnly: Bool {
-        get { d.bool(forKey: "readOnly") }
-        set { d.set(newValue, forKey: "readOnly") }
+        get { UserDefaults.standard.data(forKey: "peers").flatMap { try? JSONDecoder().decode([PeerRecord].self, from: $0) } ?? [] }
+        set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: "peers") }
     }
 }
 
 let supportDir = NSHomeDirectory() + "/Library/Application Support/ShareKeeper"
-let mountBase = NSHomeDirectory() + "/ShareKeeper"
+let syncFolder = NSHomeDirectory() + "/ShareKeeper"
 
 /// Bonjour endpoints by peer id, readable from the connection loops' threads.
 final class EndpointBook: @unchecked Sendable {
@@ -47,23 +34,79 @@ final class EndpointBook: @unchecked Sendable {
     func get(_ id: String) -> NWEndpoint? { lock.lock(); defer { lock.unlock() }; return map[id] }
 }
 
+/// Links by peer id, for the listener thread that hands over a connection a paired Mac dialed.
+final class ClientBook: @unchecked Sendable {
+    private let lock = NSLock()
+    private var map: [String: RemoteClient] = [:]
+    func set(_ id: String, _ c: RemoteClient?) { lock.lock(); map[id] = c; lock.unlock() }
+    func get(_ id: String) -> RemoteClient? { lock.lock(); defer { lock.unlock() }; return map[id] }
+}
+
+/// One paired Mac: the link to it, and the sync with it when this Mac is the one that drives it.
+struct Peer {
+    let client: RemoteClient
+    let engine: SyncEngine?     // nil: the other Mac drives, we only answer and say when something changed
+}
+
+// MARK: - Moving off 0.2
+
+/// 0.2 mounted the other Mac at ~/ShareKeeper/<name> and shared ~/ShareKeeper Drop. Undo the mounts (and
+/// their empty folders) and move whatever was put in the Drop folder into ~/ShareKeeper.
+func migrateFromMounts() {
+    var buf: UnsafeMutablePointer<statfs>?
+    let n = getmntinfo(&buf, MNT_NOWAIT)
+    if n > 0, let mounts = buf {
+        for i in 0..<Int(n) {
+            var m = mounts[i]
+            let from = withUnsafePointer(to: &m.f_mntfromname) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+            }
+            let on = withUnsafePointer(to: &m.f_mntonname) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+            }
+            guard from.hasPrefix("127.0.0.1:"), on.hasPrefix(syncFolder + "/") else { continue }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/sbin/umount")
+            p.arguments = ["-f", on]
+            try? p.run()
+            p.waitUntilExit()
+            rmdir(on)                       // only succeeds when empty, which a mount point is
+            log.notice("removed old mount \(on, privacy: .public)")
+        }
+    }
+
+    let fm = FileManager.default
+    let drop = NSHomeDirectory() + "/ShareKeeper Drop"
+    guard let items = try? fm.contentsOfDirectory(atPath: drop) else { return }
+    try? fm.createDirectory(atPath: syncFolder, withIntermediateDirectories: true)
+    for name in items {
+        let src = drop + "/" + name
+        if FileServer.ignored(name) { try? fm.removeItem(atPath: src); continue }
+        if !fm.fileExists(atPath: syncFolder + "/" + name) { try? fm.moveItem(atPath: src, toPath: syncFolder + "/" + name) }
+    }
+    rmdir(drop)                             // left in place if anything could not be moved
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     var identity: Identity!
+    var local: FileServer!
     var listener: PeerListener!
     let discovery = Discovery()
     let endpoints = EndpointBook()
+    let clients = ClientBook()
     let pathMonitor = NWPathMonitor()
-    var volumes: [String: PeerVolume] = [:]
+    var peers: [String: Peer] = [:]
     var askingCode = false      // one pairing question at a time; anything else that knocks is refused
     var lastPath: NWPath.Status?
+    var lastFingerprint: Int?
     let deviceName = Host.current().localizedName ?? "Mac"
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        let img = NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: "ShareKeeper")
+        let img = NSImage(systemSymbolName: "folder.badge.person.crop", accessibilityDescription: "ShareKeeper")
         img?.isTemplate = true
         item.button?.image = img
         let menu = NSMenu()
@@ -73,23 +116,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do { identity = try Identity.loadOrCreate(in: supportDir) }
         catch { fatal("Cannot create this Mac's key: \(error.localizedDescription)"); return }
 
-        // A mount left behind by a crash has no server any more and would hang Finder.
-        for stale in NFSMount.staleMounts(under: mountBase) {
-            log.notice("unmounting stale \(stale, privacy: .public)")
-            Self.umountSync(stale)
-        }
+        migrateFromMounts()
+        try? FileManager.default.createDirectory(atPath: syncFolder, withIntermediateDirectories: true)
+        guard let fs = FileServer(root: syncFolder) else { fatal("Cannot use the folder \(syncFolder)."); return }
+        local = fs
 
         listener = PeerListener(me: identity, name: deviceName)
         listener.lookupPeer = { id in
             Store.peers.first { Data(hex: $0.id) == id }.flatMap { Data(hex: $0.pub) }
         }
-        listener.sharedServer = {
-            guard Store.sharing, let p = Store.sharedPath else { return nil }
-            return FileServer(root: p, readOnly: Store.readOnly)
-        }
+        listener.sharedServer = { [local] in local }
         listener.confirmPairing = { [weak self] code, name in await self?.askCode(code, name) ?? false }
         listener.onPaired = { [weak self] pub, name in
-            DispatchQueue.main.async { self?.addPeer(pub: pub, name: name); self?.offerSharing(with: name) }
+            DispatchQueue.main.async { self?.addPeer(pub: pub, name: name) }
+        }
+        // A Mac that can see us dials us; its connection is then our link to it as well.
+        listener.adopt = { [clients] id, ch in
+            guard let c = clients.get(id.hex) else { return false }
+            c.adopt(ch)
+            return true
         }
         Task {
             do { try await listener.start() }
@@ -99,9 +144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         discovery.onChange = { [weak self] in self?.peersChanged() }
         discovery.start()
 
-        for rec in Store.peers { makeVolume(rec) }
+        for rec in Store.peers { makePeer(rec) }
 
-        // A network that came back, or a Mac that woke up: do not wait for the next retry.
         pathMonitor.pathUpdateHandler = { [weak self] p in
             DispatchQueue.main.async {
                 defer { self?.lastPath = p.status }
@@ -112,18 +156,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.kickAll()
         }
+
+        // Something changed in ~/ShareKeeper: sync now. And every 20 s anyway, in case a nudge got lost.
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.checkLocalChanges() }
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            self?.peers.values.forEach { $0.engine?.trigger() }
+        }
     }
 
     func applicationWillTerminate(_ n: Notification) {
-        for v in volumes.values { v.client.stop(); if v.isMounted { Self.umountSync(v.mountPath) } }
-    }
-
-    static func umountSync(_ path: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/sbin/umount")
-        p.arguments = ["-f", path]
-        try? p.run()
-        p.waitUntilExit()
+        for p in peers.values { p.client.stop() }
     }
 
     func fatal(_ text: String) {
@@ -134,23 +176,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
-    // MARK: Peers and volumes
+    // MARK: Peers
 
-    func makeVolume(_ rec: PeerRecord) {
-        guard volumes[rec.id] == nil, let pub = Data(hex: rec.pub) else { return }
+    func makePeer(_ rec: PeerRecord) {
+        guard peers[rec.id] == nil, let pub = Data(hex: rec.pub) else { return }
         let id = rec.id
         let client = RemoteClient(me: identity, peerPub: pub, endpoint: { [endpoints] in endpoints.get(id) })
-        let safe = rec.name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
-        let vol = PeerVolume(peerName: rec.name, mountPath: mountBase + "/" + safe, client: client)
-        client.onConnect = { [weak self] in Task { await self?.autoMount(id) } }
-        volumes[rec.id] = vol
+        // One Mac of the pair drives the sync, the same one on both sides: the one with the smaller id.
+        let drives = identity.id.hex < id
+        let engine = drives ? SyncEngine(local: local, remote: client, peerName: rec.name,
+                                         statePath: supportDir + "/sync-\(id).json") : nil
+        let local = self.local!
+        client.incoming = { req, body in
+            if req.op == "changed" { engine?.trigger(); return (Response(id: req.id), Data()) }
+            return await dispatch(local, req, body)
+        }
+        client.onConnect = {
+            if let engine { engine.trigger() } else { Task { await client.notifyChanged() } }
+        }
+        clients.set(id, client)
+        peers[id] = Peer(client: client, engine: engine)
         client.start()
     }
 
-    func autoMount(_ id: String) async {
-        guard let rec = Store.peers.first(where: { $0.id == id }), rec.auto, let vol = volumes[id] else { return }
-        do { try await vol.mount() }
-        catch { log.error("mount \(rec.name, privacy: .public): \(error.localizedDescription, privacy: .public)") }
+    func addPeer(pub: Data, name: String) {
+        let rec = PeerRecord(id: Identity.id(of: pub).hex, name: name, pub: pub.hex, auto: true)
+        var all = Store.peers.filter { $0.id != rec.id }
+        all.append(rec)
+        Store.peers = all
+        makePeer(rec)
+        // Show where things go, once.
+        if !UserDefaults.standard.bool(forKey: "shownFolder") {
+            UserDefaults.standard.set(true, forKey: "shownFolder")
+            NSWorkspace.shared.open(URL(fileURLWithPath: syncFolder))
+        }
     }
 
     func peersChanged() {
@@ -159,15 +218,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func kickAll() {
-        for v in volumes.values where !v.client.isConnected { v.client.kick() }
+        for p in peers.values where !p.client.isConnected { p.client.kick() }
     }
 
-    func addPeer(pub: Data, name: String) {
-        let rec = PeerRecord(id: Identity.id(of: pub).hex, name: name, pub: pub.hex, auto: true)
-        var all = Store.peers.filter { $0.id != rec.id }
-        all.append(rec)
-        Store.peers = all
-        makeVolume(rec)
+    func checkLocalChanges() {
+        let local = self.local!
+        Task.detached { [weak self] in
+            guard let entries = try? await local.scan() else { return }
+            var h = Hasher()
+            for e in entries { h.combine(e.name); h.combine(e.attr.size); h.combine(e.attr.mtime); h.combine(e.attr.kind) }
+            let f = h.finalize()
+            await MainActor.run {
+                guard let self else { return }
+                defer { self.lastFingerprint = f }
+                guard let last = self.lastFingerprint, last != f else { return }
+                for p in self.peers.values {
+                    if let e = p.engine { e.trigger() } else { Task { await p.client.notifyChanged() } }
+                }
+            }
+        }
     }
 
     func askCode(_ code: String, _ name: String) async -> Bool {
@@ -178,76 +247,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
             a.messageText = "Pair with \(name)?"
-            a.informativeText = "\(name) should show this same code:\n\n\(code)\n\nOnly continue if the codes are identical. If you did not start this, choose Cancel."
+            a.informativeText = "\(name) should show this same code:\n\n\(code)\n\nAfter pairing, the folder “ShareKeeper” in your home folder has the same contents on both Macs."
             a.addButton(withTitle: "Codes match")
             a.addButton(withTitle: "Cancel")
             return a.runModal() == .alertFirstButtonReturn
         }
     }
 
-    static let defaultShareFolder = NSHomeDirectory() + "/ShareKeeper Drop"
-
-    /// Right after pairing, for a Mac that never shared anything: share one ready-made folder, and say so.
-    /// Whoever turned sharing off or picked a folder on purpose is left alone.
-    func offerSharing(with name: String) {
-        guard Store.sharedPath == nil else { return }
-        try? FileManager.default.createDirectory(atPath: Self.defaultShareFolder, withIntermediateDirectories: true)
-        Store.sharedPath = Self.defaultShareFolder
-        Store.sharing = true
-
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.messageText = "Paired with \(name)"
-        a.informativeText = "Files you put in the folder “ShareKeeper Drop” in your home folder can be opened and changed by \(name). It cannot see anything else on this Mac. You can pick another folder, or stop sharing, in the ShareKeeper menu."
-        a.addButton(withTitle: "OK")
-        a.addButton(withTitle: "Choose Another Folder…")
-        if a.runModal() == .alertSecondButtonReturn { chooseFolder() }
-    }
-
-    func showError(_ title: String, _ error: Error) {
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.messageText = title
-        a.informativeText = error.localizedDescription
-        a.runModal()
-    }
-
     // MARK: Menu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        kickAll()   // opening the menu is a good moment to look again
         let records = Store.peers
 
-        kickAll()   // opening the menu is a good moment to look again
-        if records.isEmpty { hint(menu, "No Macs paired yet — pair with one below") }
+        if records.isEmpty { hint(menu, "Not paired with another Mac yet") }
         for (i, rec) in records.enumerated() {
-            let vol = volumes[rec.id]
-            let mounted = vol?.isMounted ?? false
-            let client = vol?.client
+            guard let p = peers[rec.id] else { continue }
             let status: String
-            if mounted { status = "mounted" }
-            else if !rec.auto { status = "paused" }
-            else if client?.isConnected == true { status = client?.peerSharing == true ? "connecting…" : "not sharing a folder yet" }
-            else if endpoints.get(rec.id) == nil { status = "not found on the network" }
-            else { status = "cannot connect" }
+            var why: String?
+            if p.client.isConnected {
+                if let e = p.engine {
+                    if e.isRunning { status = "syncing…" }
+                    else if e.lastError != nil { status = "some files could not be synced"; why = "ShareKeeper tries again by itself." }
+                    else if let t = e.lastRun { status = "in sync (\(t.formatted(date: .omitted, time: .shortened)))" }
+                    else { status = "connected" }
+                } else {
+                    status = "connected"
+                }
+            } else if endpoints.get(rec.id) == nil {
+                status = "not found on the network"
+                why = "Is ShareKeeper running on \(rec.name)? Syncing continues by itself when it shows up."
+            } else {
+                status = "cannot connect"
+                why = "ShareKeeper keeps trying."
+            }
             let row = NSMenuItem(title: "\(rec.name) — \(status)", action: nil, keyEquivalent: "")
-            row.state = mounted ? .on : .off
             let sub = NSMenu()
-            if mounted { act(sub, "Open in Finder", #selector(openPeer(_:)), i) }
-            act(sub, mounted ? "Unmount" : "Mount", mounted ? #selector(unmountPeer(_:)) : #selector(mountPeer(_:)), i)
-            sub.addItem(.separator())
-            act(sub, "Forget This Mac", #selector(forgetPeer(_:)), i)
+            if let why { hint(sub, why); sub.addItem(.separator()) }
+            let forget = NSMenuItem(title: "Forget This Mac", action: #selector(forgetPeer(_:)), keyEquivalent: "")
+            forget.target = self; forget.tag = i; sub.addItem(forget)
             row.submenu = sub
             menu.addItem(row)
         }
+
+        let open = NSMenuItem(title: "Open ShareKeeper Folder", action: #selector(openFolder), keyEquivalent: "o")
+        open.target = self
+        menu.addItem(open)
         menu.addItem(.separator())
 
         let others = discovery.peers.values
             .filter { p in p.id != identity.id.hex && !records.contains(where: { r in r.id == p.id }) }
             .sorted { $0.name < $1.name }
-        let pair = NSMenuItem(title: "Pair with…", action: nil, keyEquivalent: "")
+        let pair = NSMenuItem(title: "Pair a New Mac", action: nil, keyEquivalent: "")
         let pairMenu = NSMenu()
-        if others.isEmpty { hint(pairMenu, "No other Macs found") }
+        if others.isEmpty { hint(pairMenu, "No other Macs with ShareKeeper found nearby") }
         for p in others {
             let i = NSMenuItem(title: p.name, action: #selector(pairWith(_:)), keyEquivalent: "")
             i.representedObject = p.id; i.target = self; pairMenu.addItem(i)
@@ -256,24 +310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(pair)
         menu.addItem(.separator())
 
-        if !records.isEmpty && !Store.sharing { hint(menu, "Nothing is shared from this Mac yet") }
-        let share = NSMenuItem(title: "Share a Folder from This Mac", action: #selector(toggleSharing), keyEquivalent: "")
-        share.target = self; share.state = Store.sharing ? .on : .off
-        menu.addItem(share)
-        if let p = Store.sharedPath {
-            let show = NSMenuItem(title: "Show “\((p as NSString).lastPathComponent)” in Finder", action: #selector(showShared), keyEquivalent: "")
-            show.target = self; menu.addItem(show)
-            let folder = NSMenuItem(title: "Choose Another Folder…", action: #selector(chooseFolder), keyEquivalent: "")
-            folder.target = self; menu.addItem(folder)
-            let ro = NSMenuItem(title: "Read-only", action: #selector(toggleReadOnly), keyEquivalent: "")
-            ro.target = self; ro.state = Store.readOnly ? .on : .off; menu.addItem(ro)
-        }
-        menu.addItem(.separator())
-
         let login = NSMenuItem(title: "Launch on login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
-        menu.addItem(.separator())
         menu.addItem(withTitle: "Quit ShareKeeper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
@@ -283,46 +322,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(i)
     }
 
-    func act(_ menu: NSMenu, _ title: String, _ sel: Selector, _ tag: Int) {
-        let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
-        i.target = self; i.tag = tag; menu.addItem(i)
-    }
-
-    func record(_ s: NSMenuItem) -> PeerRecord? { Store.peers.indices.contains(s.tag) ? Store.peers[s.tag] : nil }
-
-    @objc func openPeer(_ s: NSMenuItem) {
-        guard let rec = record(s), let v = volumes[rec.id] else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: v.mountPath))
-    }
-
-    @objc func mountPeer(_ s: NSMenuItem) {
-        guard let rec = record(s) else { return }
-        var all = Store.peers
-        all[s.tag].auto = true
-        Store.peers = all
-        guard let v = volumes[rec.id] else { return }
-        v.client.kick()
-        Task {
-            do { try await v.mount() }
-            catch { await MainActor.run { self.showError("Cannot mount \(rec.name)", error) } }
-        }
-    }
-
-    @objc func unmountPeer(_ s: NSMenuItem) {
-        guard let rec = record(s), let v = volumes[rec.id] else { return }
-        var all = Store.peers
-        all[s.tag].auto = false
-        Store.peers = all
-        Task { await v.unmount() }
+    @objc func openFolder() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: syncFolder))
     }
 
     @objc func forgetPeer(_ s: NSMenuItem) {
-        guard let rec = record(s) else { return }
-        Store.peers = Store.peers.filter { $0.id != rec.id }
-        if let v = volumes.removeValue(forKey: rec.id) {
-            v.client.stop()
-            Task { await v.unmount() }
-        }
+        let records = Store.peers
+        guard records.indices.contains(s.tag) else { return }
+        let rec = records[s.tag]
+        Store.peers = records.filter { $0.id != rec.id }
+        clients.set(rec.id, nil)
+        peers.removeValue(forKey: rec.id)?.client.stop()
+        try? FileManager.default.removeItem(atPath: supportDir + "/sync-\(rec.id).json")
     }
 
     @objc func pairWith(_ s: NSMenuItem) {
@@ -336,43 +347,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     try await Pairing.initiate(conn, me: me, name: name, confirm: { code, n in await self.askCode(code, n) })
                 }
                 conn.close()
-                await MainActor.run { self.addPeer(pub: pub, name: peerName); self.offerSharing(with: peerName) }
+                await MainActor.run { self.addPeer(pub: pub, name: peerName) }
             } catch let e as FSError where e.code == ECANCELED {
                 log.notice("pairing cancelled")
             } catch {
                 log.error("pairing failed: \(String(describing: error), privacy: .public)")
                 await MainActor.run {
-                    self.showError("Pairing with \(peer.name) failed",
-                                   MountError.unreachable(peer.name, nil))
+                    NSApp.activate(ignoringOtherApps: true)
+                    let a = NSAlert()
+                    a.messageText = "Pairing with \(peer.name) failed"
+                    a.informativeText = "Is ShareKeeper running on \(peer.name), and are both Macs on the same network?"
+                    a.runModal()
                 }
             }
         }
     }
-
-    @objc func toggleSharing() {
-        if Store.sharedPath == nil { chooseFolder(); return }
-        Store.sharing.toggle()
-    }
-
-    @objc func chooseFolder() {
-        NSApp.activate(ignoringOtherApps: true)
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.prompt = "Share"
-        panel.message = "Macs you pair with can see and change everything in this folder, and nothing outside it."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Store.sharedPath = url.path
-        Store.sharing = true
-    }
-
-    @objc func showShared() {
-        guard let p = Store.sharedPath else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: p))
-    }
-
-    @objc func toggleReadOnly() { Store.readOnly.toggle() }
 
     @objc func toggleLogin() {
         do {

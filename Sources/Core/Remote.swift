@@ -26,6 +26,8 @@ final class RemoteClient: FileBackend, @unchecked Sendable {
 
     var onConnect: (@Sendable () -> Void)?
     var onDisconnect: (@Sendable () -> Void)?
+    /// Answers the other Mac's requests on this same link (it mounts our shared folder over it).
+    var incoming: (@Sendable (Request, Data) async -> (Response, Data))?
 
     private struct Pending {
         let k: CheckedContinuation<(Response, Data), Error>
@@ -106,37 +108,88 @@ final class RemoteClient: FileBackend, @unchecked Sendable {
     private func connectOnce() async {
         guard let ep = endpoint() else { return }
         let conn = Conn(to: ep)
+        var mine: Channel?
         do {
             try await conn.start(timeout: 8)
             let me = self.me, peerPub = self.peerPub
             let ch = try await withTimeout(8, onTimeout: { conn.close() }) {
                 try await Handshake.initiate(conn, me: me, peerPub: peerPub)
             }
-            lock.lock(); channel = ch; lock.unlock()
-            Task { await self.readLoop(ch) }
-            // The first answer proves the other side holds the key it paired with.
-            let (pong, _) = try await callRaw(ch, Request(op: "ping"), Data(), timeout: 8)
-            lock.lock(); connected = true; failures = 0; sharing = pong.sharing ?? false; lastError = nil; lock.unlock()
-            log.notice("connected to peer, sharing: \(pong.sharing ?? false)")
-            onConnect?()
+            mine = ch
+            try await establish(ch)
         } catch {
+            conn.close()
+            if let e = error as? FSError, e.code == EALREADY { return }   // the other Mac dialed us first
             log.error("connect failed: \(String(describing: error), privacy: .public)")
             lock.lock()
             failures += 1
             lastError = String(describing: error)
             nextAttempt = Date().addingTimeInterval(Double(min(2 + failures * 2, 20)))
             lock.unlock()
-            conn.close()
-            dropChannel(nil)
+            if let mine { dropChannel(mine) }
         }
+    }
+
+    /// The other Mac dialed us and passed the key check: use its connection as our link to it as well,
+    /// so a Mac that cannot find the other on Bonjour can still mount the other's folder.
+    func adopt(_ ch: Channel) {
+        Task {
+            do { try await establish(ch) }
+            catch {
+                ch.conn.close()
+                if let e = error as? FSError, e.code == EALREADY { return }
+                log.error("adopt failed: \(String(describing: error), privacy: .public)")
+                dropChannel(ch)
+            }
+        }
+    }
+
+    /// Takes a channel into use. If both Macs dialed at the same moment there are two; both sides keep the
+    /// one dialed by the Mac with the smaller id, so they agree without talking about it.
+    private func establish(_ ch: Channel) async throws {
+        let iAmSmaller = me.id.hex < Identity.id(of: peerPub).hex
+        lock.lock()
+        if let existing = channel {
+            let existingPreferred = existing.initiator == iAmSmaller
+            let newPreferred = ch.initiator == iAmSmaller
+            // Keep the existing one only when it is the one both sides prefer and the new one is not. In any
+            // other case the new one wins: a Mac dials again because it believes the old link is gone.
+            if existingPreferred && !newPreferred { lock.unlock(); throw FSError(EALREADY) }
+            lock.unlock()
+            dropChannel(existing)
+            lock.lock()
+        }
+        channel = ch
+        lock.unlock()
+        Task { await self.readLoop(ch) }
+        // The first answer proves the other side holds the key it paired with (when we dialed) and
+        // tells us whether it is sharing a folder.
+        let (pong, _) = try await callRaw(ch, Request(op: "ping"), Data(), timeout: 8)
+        lock.lock()
+        connected = true; failures = 0; sharing = pong.sharing ?? false; lastError = nil
+        lock.unlock()
+        log.notice("linked to peer (we dialed: \(ch.initiator)), peer sharing: \(pong.sharing ?? false)")
+        onConnect?()
     }
 
     private func readLoop(_ ch: Channel) async {
         do {
             while true {
                 let frame = try await ch.recv()
-                let (resp, body) = try Frame.unpack(Response.self, frame)
-                complete(resp.id, .success((resp, body)))
+                guard let tag = frame.first else { throw FSError(EPROTO) }
+                let payload = Data(frame.dropFirst())
+                if tag == Tag.response {
+                    let (resp, body) = try Frame.unpack(Response.self, payload)
+                    complete(resp.id, .success((resp, body)))
+                } else if tag == Tag.request {
+                    let (req, body) = try Frame.unpack(Request.self, payload)
+                    Task {
+                        let (resp, out) = await self.incoming?(req, body) ?? (Response(id: req.id, err: ENOSYS), Data())
+                        if let reply = try? Frame.pack(resp, body: out) { try? await ch.send(Data([Tag.response]) + reply) }
+                    }
+                } else {
+                    throw FSError(EPROTO)
+                }
             }
         } catch { log.notice("read loop ended: \(String(describing: error), privacy: .public)") }
         dropChannel(ch)
@@ -184,7 +237,7 @@ final class RemoteClient: FileBackend, @unchecked Sendable {
             pending[sent.id] = Pending(k: k, timer: timer)
             lock.unlock()
             Task {
-                do { try await ch.send(try Frame.pack(sent, body: body)) }
+                do { try await ch.send(Data([Tag.request]) + (try Frame.pack(sent, body: body))) }
                 catch { if self.complete(sent.id, .failure(error)) { log.error("send failed: \(String(describing: error), privacy: .public)"); self.dropChannel(ch) } }
             }
         }
@@ -244,93 +297,16 @@ final class RemoteClient: FileBackend, @unchecked Sendable {
         guard let s = try await rpc(Request(op: "statfs")).0.stat else { throw FSError(EPROTO) }
         return s
     }
-}
 
-/// A couple of seconds of attribute and listing cache in front of a slow backend. The NFS client asks
-/// for attributes constantly; without this every `ls -l` would be a round trip per file.
-final class CachingBackend: FileBackend, @unchecked Sendable {
-    private let inner: FileBackend
-    private let ttl: TimeInterval
-    private let lock = NSLock()
-    private var attrs: [String: (Attr, Date)] = [:]
-    private var dirs: [String: ([Entry], Date)] = [:]
-
-    init(_ inner: FileBackend, ttl: TimeInterval = 2) {
-        self.inner = inner
-        self.ttl = ttl
-    }
-
-    private func forget(_ path: String) {
-        lock.lock(); defer { lock.unlock() }
-        let parent = parentPath(path)
-        attrs[path] = nil; dirs[path] = nil
-        attrs[parent] = nil; dirs[parent] = nil
-    }
-
-    private func forgetAll() {
-        lock.lock(); attrs = [:]; dirs = [:]; lock.unlock()
-    }
-
-    func getattr(_ path: String) async throws -> Attr {
-        lock.lock()
-        if let (a, t) = attrs[path], Date().timeIntervalSince(t) < ttl { lock.unlock(); return a }
-        lock.unlock()
-        let a = try await inner.getattr(path)
-        lock.lock(); attrs[path] = (a, Date()); lock.unlock()
-        return a
-    }
-
-    func readdir(_ path: String) async throws -> [Entry] {
-        lock.lock()
-        if let (e, t) = dirs[path], Date().timeIntervalSince(t) < ttl { lock.unlock(); return e }
-        lock.unlock()
-        let e = try await inner.readdir(path)
-        let now = Date()
-        lock.lock()
-        dirs[path] = (e, now)
-        for x in e { attrs[joinPath(path, x.name)] = (x.attr, now) }
-        lock.unlock()
+    func scan() async throws -> [Entry] {
+        guard let e = try await rpc(Request(op: "scan"), timeout: 60).0.entries else { throw FSError(EPROTO) }
         return e
     }
 
-    func read(_ path: String, offset: UInt64, count: UInt32) async throws -> (Data, Bool) {
-        try await inner.read(path, offset: offset, count: count)
-    }
+    func trash(_ path: String) async throws { _ = try await rpc(Request(op: "trash", path: path)) }
 
-    func write(_ path: String, offset: UInt64, data: Data) async throws -> UInt32 {
-        defer { forget(path) }
-        return try await inner.write(path, offset: offset, data: data)
+    /// Tells the other Mac that something changed here, so it syncs now instead of at its next round.
+    func notifyChanged() async {
+        _ = try? await rpc(Request(op: "changed"), wait: 0, timeout: 5)
     }
-
-    func create(_ path: String, mode: UInt32, exclusive: Bool) async throws -> Attr {
-        defer { forget(path) }
-        return try await inner.create(path, mode: mode, exclusive: exclusive)
-    }
-
-    func mkdir(_ path: String, mode: UInt32) async throws -> Attr {
-        defer { forget(path) }
-        return try await inner.mkdir(path, mode: mode)
-    }
-
-    func remove(_ path: String) async throws {
-        defer { forget(path) }
-        try await inner.remove(path)
-    }
-
-    func rmdir(_ path: String) async throws {
-        defer { forgetAll() }
-        try await inner.rmdir(path)
-    }
-
-    func rename(_ from: String, _ to: String) async throws {
-        defer { forgetAll() }
-        try await inner.rename(from, to)
-    }
-
-    func setattr(_ path: String, mode: UInt32?, size: UInt64?, atime: Double?, mtime: Double?) async throws -> Attr {
-        defer { forget(path) }
-        return try await inner.setattr(path, mode: mode, size: size, atime: atime, mtime: mtime)
-    }
-
-    func statfs() async throws -> FsStat { try await inner.statfs() }
 }

@@ -51,6 +51,12 @@ struct Response: Codable {
     var sharing: Bool? = nil
 }
 
+/// First byte of every frame on a link. Either Mac may dial, and both ask and answer on the same link.
+enum Tag {
+    static let request: UInt8 = 0x51   // "Q"
+    static let response: UInt8 = 0x41  // "A"
+}
+
 enum Frame {
     static func pack<T: Encodable>(_ header: T, body: Data = Data()) throws -> Data {
         let json = try JSONEncoder().encode(header)
@@ -84,4 +90,9 @@ protocol FileBackend: AnyObject {
     func rename(_ from: String, _ to: String) async throws
     func setattr(_ path: String, mode: UInt32?, size: UInt64?, atime: Double?, mtime: Double?) async throws -> Attr
     func statfs() async throws -> FsStat
+    /// Everything below the root, depth first, as entries whose name is the virtual path ("/a/b.txt").
+    /// Symlinks, other file systems and Finder's bookkeeping files are left out.
+    func scan() async throws -> [Entry]
+    /// Moves a file or folder to the Trash of the Mac that owns it.
+    func trash(_ path: String) async throws
 }

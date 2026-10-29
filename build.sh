@@ -13,7 +13,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <key>CFBundleName</key><string>ShareKeeper</string>
 <key>CFBundleExecutable</key><string>ShareKeeper</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleShortVersionString</key><string>0.3.0</string>
 <key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>ShareKeeper finds your other Macs running ShareKeeper and connects to them to share folders.</string>
 <key>NSBonjourServices</key><array><string>_sharekeeper._tcp</string></array>
