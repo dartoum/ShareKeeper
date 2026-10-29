@@ -367,10 +367,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(pair)
         menu.addItem(.separator())
 
-        let login = NSMenuItem(title: "Launch on login", action: #selector(toggleLogin), keyEquivalent: "")
-        login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
+        login.target = self
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
-        menu.addItem(withTitle: "Quit ShareKeeper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        hint(menu, "Version \(version)")
+        // Own selector: AppKit puts an icon on the standard terminate item in macOS 26.
+        let quit = NSMenuItem(title: "Quit ShareKeeper", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
     }
 
     func hint(_ menu: NSMenu, _ text: String) {
@@ -419,6 +425,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         }
     }
+
+    @objc func quit() { NSApp.terminate(nil) }
 
     @objc func toggleLogin() {
         do {
