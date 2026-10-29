@@ -137,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        let img = NSImage(systemSymbolName: "folder.badge.person.crop", accessibilityDescription: "ShareKeeper")
+        let img = NSImage(systemSymbolName: "folder", accessibilityDescription: "ShareKeeper")
         img?.isTemplate = true
         item.button?.image = img
         let menu = NSMenu()
