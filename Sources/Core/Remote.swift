@@ -305,6 +305,12 @@ final class RemoteClient: FileBackend, @unchecked Sendable {
 
     func trash(_ path: String) async throws { _ = try await rpc(Request(op: "trash", path: path)) }
 
+    /// Tells the other Mac what a sync run did (from its point of view), so it can say so to its user.
+    func notifyReport(_ r: SyncReport) async {
+        guard let body = try? JSONEncoder().encode(r) else { return }
+        _ = try? await rpc(Request(op: "report"), body: body, wait: 0, timeout: 5)
+    }
+
     /// Tells the other Mac that something changed here, so it syncs now instead of at its next round.
     func notifyChanged() async {
         _ = try? await rpc(Request(op: "changed"), wait: 0, timeout: 5)

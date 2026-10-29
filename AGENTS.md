@@ -26,6 +26,11 @@ only. One Mac is restricted with File Sharing off there, so this does not use Fi
 - **Confinement** (`FileServer.swift`), on the Mac that owns the files: no `..`, symlinks only followed when
   they stay inside the folder, `scan` does not follow them at all.
 
+- **App behaviour**: Dock icon by default (menu: "Show in Dock" to go menu-bar only), click on it opens the
+  folder. Notifications (UserNotifications): paired, and per sync run what arrived / was removed / was kept
+  twice; the driving Mac sends the other Mac a mirrored `SyncReport` ("report" request) so both say it.
+  App icon: `assets/make-icon.sh` regenerates `AppIcon.icns` from `make-icon.swift`.
+
 ## Decisions
 - Sync, not a mounted network drive (0.2 mounted the other Mac via a loopback NFS server). Wanted: one
   ordinary folder in home with only the shared things in it, on both Macs. Sync gives exactly that, keeps
@@ -49,4 +54,12 @@ only. One Mac is restricted with File Sharing off there, so this does not use Fi
 - Change detection is polling (3 s); fine for an exchange folder, not for very large trees (FSEvents).
 - A scan reply is one frame (max 4 MB), roughly 20 000 entries.
 - An edit made in the moment a copy over that same file is renamed into place can be lost.
-- The dmg is ad-hoc signed: Gatekeeper needs right-click → Open the first time.
+- Signing: `build.sh` takes Developer ID Application if present, else Apple Development (this Mac has
+  one), else ad-hoc. Apple Development gives a stable identity (Local Network / notification permission
+  survive rebuilds) but `spctl` still rejects it, so on another Mac the first start needs right-click → Open.
+  Fixing that needs a paid Developer ID certificate plus notarization (`xcrun notarytool submit … --wait`,
+  then `xcrun stapler staple`); `build.sh` already adds the hardened runtime for Developer ID.
+
+## Release
+`./dmg.sh` → `ShareKeeper-<version>.dmg` + `.zip` (version from `build.sh`), attach both to a GitHub release
+tagged `v<version>` (`gh release create`).

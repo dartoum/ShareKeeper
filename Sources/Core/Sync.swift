@@ -14,6 +14,22 @@ struct Sig: Codable, Equatable {
     }
 }
 
+/// What one sync run did, as seen from this Mac's side ("local"). Mirrored when it is told to the other Mac.
+struct SyncReport: Codable {
+    var receivedHere: [String] = []      // new or changed files that arrived on this Mac
+    var sentAway: [String] = []          // ... that were copied to the other Mac
+    var trashedHere: [String] = []       // deleted here because the other Mac deleted them
+    var trashedAway: [String] = []
+    var conflicts: [String] = []         // files changed on both; both versions were kept
+
+    var isEmpty: Bool { receivedHere.isEmpty && sentAway.isEmpty && trashedHere.isEmpty && trashedAway.isEmpty && conflicts.isEmpty }
+
+    /// The same run from the other Mac's point of view.
+    var mirrored: SyncReport {
+        SyncReport(receivedHere: sentAway, sentAway: receivedHere, trashedHere: trashedAway, trashedAway: trashedHere, conflicts: conflicts)
+    }
+}
+
 /// Keeps one folder the same on this Mac and one paired Mac. A three-way comparison: what each side has
 /// now, and what both had after the last run ("base"). That is what tells a new file from a deleted one.
 ///
@@ -37,6 +53,8 @@ final class SyncEngine: @unchecked Sendable {
     private var _lastError: String?
 
     var onChange: (@Sendable () -> Void)?
+    /// Called after a run that changed something.
+    var onReport: (@Sendable (SyncReport) -> Void)?
 
     init(local: FileBackend, remote: FileBackend, peerName: String, statePath: String?) {
         self.local = local
@@ -89,6 +107,7 @@ final class SyncEngine: @unchecked Sendable {
         var next: [String: Sig] = [:]
         var gone: [String] = []       // trashed folders: everything below them is gone too
         var failed = 0
+        var report = SyncReport()
 
         func below(_ p: String, _ roots: [String]) -> Bool { roots.contains { p == $0 || p.hasPrefix($0 + "/") } }
         func untouched(_ side: [String: Sig], under p: String) -> Bool {
@@ -110,8 +129,10 @@ final class SyncEngine: @unchecked Sendable {
                     }
                     if b == x {
                         try await copy(p, from: remote, to: local); next[p] = y
+                        if !y.dir { report.receivedHere.append(p) }
                     } else if b == y {
                         try await copy(p, from: local, to: remote); next[p] = x
+                        if !x.dir { report.sentAway.append(p) }
                     } else {
                         // Changed on both: keep ours under the name, theirs next to it with their name on it.
                         let alt = try await conflictPath(p)
@@ -120,18 +141,23 @@ final class SyncEngine: @unchecked Sendable {
                         try await copy(p, from: local, to: remote)
                         next[p] = x
                         next[alt] = Sig(try await local.getattr(alt))
+                        report.conflicts.append(p)
                     }
                 case let (x?, nil):
                     if let b, b == x, !x.dir || untouched(l, under: p) {
                         try await local.trash(p); gone.append(p)        // they deleted it, we did not touch it
+                        report.trashedHere.append(p)
                     } else {
                         try await copy(p, from: local, to: remote); next[p] = x
+                        if !x.dir { report.sentAway.append(p) }
                     }
                 case let (nil, y?):
                     if let b, b == y, !y.dir || untouched(r, under: p) {
                         try await remote.trash(p); gone.append(p)
+                        report.trashedAway.append(p)
                     } else {
                         try await copy(p, from: remote, to: local); next[p] = y
+                        if !y.dir { report.receivedHere.append(p) }
                     }
                 case (nil, nil):
                     break
@@ -145,6 +171,7 @@ final class SyncEngine: @unchecked Sendable {
 
         lock.lock(); self.base = next; lock.unlock()
         save(next)
+        if !report.isEmpty { onReport?(report) }
         if failed > 0 { throw FSError(EIO) }
     }
 

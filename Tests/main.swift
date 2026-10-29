@@ -14,6 +14,13 @@ func errno(of op: () async throws -> Void) async -> Int32 {
     do { try await op(); return 0 } catch let e as FSError { return e.code } catch { return -1 }
 }
 
+final class Reports: @unchecked Sendable {
+    private let lock = NSLock()
+    private var list: [SyncReport] = []
+    func add(_ r: SyncReport) { lock.lock(); list.append(r); lock.unlock() }
+    var all: [SyncReport] { lock.lock(); defer { lock.unlock() }; return list }
+}
+
 let fm = FileManager.default
 func write(_ path: String, _ text: String) { try! text.write(toFile: path, atomically: true, encoding: .utf8) }
 func read(_ path: String) -> String? { try? String(contentsOfFile: path, encoding: .utf8) }
@@ -133,7 +140,13 @@ func run() async {
     try! fm.createDirectory(atPath: right + "/untitled folder/deep", withIntermediateDirectories: true)
     write(right + "/untitled folder/deep/b.txt", "from right")
     write(left + "/.DS_Store", "finder junk")
+    let reports = Reports()
+    engine.onReport = { r in reports.add(r) }
     check("first sync", await sync())
+    check("report names what arrived and what was sent",
+          reports.all.last?.receivedHere == ["/untitled folder/deep/b.txt"] && reports.all.last?.sentAway == ["/a.txt"],
+          "\(String(describing: reports.all.last))")
+    check("mirrored report is the other Mac's view", reports.all.last?.mirrored.receivedHere == ["/a.txt"])
     check("both sides have everything", listing(left) == listing(right) && listing(left) == ["a.txt", "untitled folder", "untitled folder/deep", "untitled folder/deep/b.txt"],
           "\(listing(left)) | \(listing(right))")
     check("contents arrived", read(right + "/a.txt") == "from left" && read(left + "/untitled folder/deep/b.txt") == "from right")

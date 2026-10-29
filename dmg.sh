@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds ShareKeeper.app and packs it into ShareKeeper-<version>.dmg (app + Applications shortcut).
+# Builds ShareKeeper.app and packs it into ShareKeeper-<version>.dmg (app + Applications shortcut) and .zip.
 set -euo pipefail
 cd "$(dirname "$0")"
 ./build.sh
@@ -11,4 +11,7 @@ cp -R ShareKeeper.app "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
 hdiutil create -quiet -volname "ShareKeeper" -srcfolder "$STAGE" -format UDZO -fs HFS+ "$DMG"
-echo "Done: $PWD/$DMG"
+ZIP="ShareKeeper-$VERSION.zip"
+rm -f "$ZIP"
+ditto -c -k --keepParent ShareKeeper.app "$ZIP"
+echo "Done: $PWD/$DMG and $PWD/$ZIP"

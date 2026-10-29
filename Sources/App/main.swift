@@ -1,6 +1,7 @@
 import Cocoa
 import Network
 import ServiceManagement
+import UserNotifications
 import os
 
 // ShareKeeper: one folder, ~/ShareKeeper, with the same contents on every Mac you pair. Put something in
@@ -20,6 +21,41 @@ enum Store {
     static var peers: [PeerRecord] {
         get { UserDefaults.standard.data(forKey: "peers").flatMap { try? JSONDecoder().decode([PeerRecord].self, from: $0) } ?? [] }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: "peers") }
+    }
+    /// In the Dock and Cmd-Tab like any app (default), or only in the menu bar.
+    static var showDock: Bool {
+        get { UserDefaults.standard.object(forKey: "showDock") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "showDock") }
+    }
+}
+
+enum Notifier {
+    static func setup(_ delegate: UNUserNotificationCenterDelegate) {
+        let c = UNUserNotificationCenter.current()
+        c.delegate = delegate
+        c.requestAuthorization(options: [.alert]) { granted, error in
+            log.notice("notifications allowed: \(granted), error: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    static func post(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    /// "3 files from MacBook: a.txt, b.txt, c.txt", or nil when this Mac has nothing to be told.
+    static func describe(_ r: SyncReport) -> String? {
+        func names(_ l: [String]) -> String {
+            let n = l.prefix(3).map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+            return l.count > 3 ? n + " …" : n
+        }
+        var lines: [String] = []
+        if !r.receivedHere.isEmpty { lines.append("\(r.receivedHere.count) new or changed: \(names(r.receivedHere))") }
+        if !r.trashedHere.isEmpty { lines.append("\(r.trashedHere.count) removed (in your Trash): \(names(r.trashedHere))") }
+        if !r.conflicts.isEmpty { lines.append("Changed on both Macs, both versions kept: \(names(r.conflicts))") }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 }
 
@@ -89,7 +125,7 @@ func migrateFromMounts() {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var item: NSStatusItem!
     var identity: Identity!
     var local: FileServer!
@@ -116,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do { identity = try Identity.loadOrCreate(in: supportDir) }
         catch { fatal("Cannot create this Mac's key: \(error.localizedDescription)"); return }
 
+        Notifier.setup(self)
         migrateFromMounts()
         try? FileManager.default.createDirectory(atPath: syncFolder, withIntermediateDirectories: true)
         guard let fs = FileServer(root: syncFolder) else { fatal("Cannot use the folder \(syncFolder)."); return }
@@ -168,6 +205,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for p in peers.values { p.client.stop() }
     }
 
+    // Notifications also show while the app is in front (the menu bar app often is).
+    func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner])
+    }
+
+    /// Clicking the Dock icon opens the folder, which is what the app is about.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openFolder()
+        return false
+    }
+
     func fatal(_ text: String) {
         let a = NSAlert()
         a.messageText = "ShareKeeper"
@@ -187,8 +236,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let engine = drives ? SyncEngine(local: local, remote: client, peerName: rec.name,
                                          statePath: supportDir + "/sync-\(id).json") : nil
         let local = self.local!
+        let name = rec.name
+        // This Mac drives: say what arrived here, and tell the other Mac what arrived there.
+        engine?.onReport = { r in
+            if let text = Notifier.describe(r) { Notifier.post("From \(name)", text) }
+            Task { await client.notifyReport(r.mirrored) }
+        }
         client.incoming = { req, body in
             if req.op == "changed" { engine?.trigger(); return (Response(id: req.id), Data()) }
+            if req.op == "report" {      // the other Mac drove a sync and tells us what it did to our folder
+                if let r = try? JSONDecoder().decode(SyncReport.self, from: body), let text = Notifier.describe(r) {
+                    Notifier.post("From \(name)", text)
+                }
+                return (Response(id: req.id), Data())
+            }
             return await dispatch(local, req, body)
         }
         client.onConnect = {
@@ -205,6 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         all.append(rec)
         Store.peers = all
         makePeer(rec)
+        Notifier.post("Paired with \(name)", "The folder “ShareKeeper” in your home folder now has the same contents on both Macs.")
         // Show where things go, once.
         if !UserDefaults.standard.bool(forKey: "shownFolder") {
             UserDefaults.standard.set(true, forKey: "shownFolder")
@@ -310,6 +372,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(pair)
         menu.addItem(.separator())
 
+        let dock = NSMenuItem(title: "Show in Dock", action: #selector(toggleDock), keyEquivalent: "")
+        dock.target = self; dock.state = Store.showDock ? .on : .off
+        menu.addItem(dock)
         let login = NSMenuItem(title: "Launch on login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -363,6 +428,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc func toggleDock() {
+        Store.showDock.toggle()
+        NSApp.setActivationPolicy(Store.showDock ? .regular : .accessory)
+    }
+
     @objc func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -374,5 +444,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(Store.showDock ? .regular : .accessory)
 app.run()
